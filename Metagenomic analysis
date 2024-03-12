@@ -1,0 +1,904 @@
+Paired-end reads
+
+From biokbase.narrative.jobs.appmanager import AppManager
+AppManager().run_app_batch(
+    [{
+        "app_id": "kb_uploadmethods/import_fastq_noninterleaved_as_reads_from_staging",
+        "tag": "release",
+        "version": "5b9346463df88a422ff5d4f4cba421679f63c73f",
+        "params": [{
+            "fastq_fwd_staging_file_name": "MetGen-UDP0136_BSS5_S5_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0136_BSS5_S5_L004_R2_001.fastq.gz",
+            "name": "BSS5"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0135_BSS4_S4_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0135_BSS4_S4_L004_R2_001.fastq.gz",
+            "name": "BSS4"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0134_BSS3_S3_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0134_BSS3_S3_L004_R2_001.fastq.gz",
+            "name": "BSS3"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0133_BSS2_S2_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0133_BSS2_S2_L004_R2_001.fastq.gz",
+            "name": "BSS2"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0132_BSS1_S1_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0132_BSS1_S1_L004_R2_001.fastq.gz",
+            "name": "BSS1"
+        }],
+"fastq_fwd_staging_file_name": "MetGen-UDP0141_RSS5_S10_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0141_RSS5_S10_L004_R2_001.fastq.gz",
+            "name": "RSS5"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0140_RSS4_S9_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0140_RSS4_S9_L004_R2_001.fastq.gz",
+            "name": "RSS4"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0139_RSS3_S8_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0139_RSS3_S8_L004_R2_001.fastq.gz",
+            "name": "RSS3"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0138_RSS2_S7_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0138_RSS2_S7_L004_R2_001.fastq.gz",
+            "name": "RSS2"
+        }, {
+            "fastq_fwd_staging_file_name": "MetGen-UDP0137_RSS1_S6_L004_R1_001.fastq.gz",
+            "fastq_rev_staging_file_name": "MetGen-UDP0137_RSS1_S6_L004_R2_001.fastq.gz",
+            "name": "RSS1"
+        }],
+        "shared_params": {
+            "sequencing_tech": "Illumina",
+            "single_genome": 1,
+            "read_orientation_outward": 0,
+            "insert_size_std_dev": None,
+            "insert_size_mean": None
+        }
+    }],
+    cell_id="4ed5f8a7-5c14-4c38-b84a-62f778ed992b",
+    run_id="1d284bf3-e8e6-42f3-8ef2-e383d1bc3bc5")
+
+Initial sequence statistics
+#input: .fna or .fastq
+#outputs: ${out_prefix}.drisee.stats, ${out_prefix}.drisee.info,
+#         ${out_prefix}.consensus.stats, ${out_prefix}.kmer.$len.stats,
+#         ${out_prefix}.assembly.coverage
+#         ${out_prefix}.qc.stats
+#	  ${out_prefix}.upload.stats	
+
+use strict;
+use warnings;
+no warnings('once');
+
+use PipelineAWE;
+use List::Util qw(first max min sum);
+use POSIX qw(strftime floor);
+use Getopt::Long;
+use Cwd;
+umask 000;
+
+# options
+my $infile = "";
+my $format = "";
+my $name   = "raw";
+my $proc   = 8;
+my $kmers  = '15,6';
+my $out_prefix = "qc";
+my $assembled  = 0;
+my $filter_options = "";
+my $help = 0;
+my $options = GetOptions (
+		"input=s"  => \$infile,
+		"format=s" => \$format,
+		"name=s"   => \$name,
+		"proc=i"   => \$proc,
+		"kmers=s"  => \$kmers,
+		"out_prefix=s" => \$out_prefix,
+        "assembled=i"  => \$assembled,
+        "filter_options=s" => \$filter_options,
+		"help!" => \$help,
+);
+
+if ($help){
+    print get_usage();
+    exit 0;
+}elsif (length($infile)==0){
+    PipelineAWE::logger('error', "input file was not specified");
+    exit 1;
+}elsif (! -e $infile){
+    PipelineAWE::logger('error', "input sequence file [$infile] does not exist");
+    exit 1;
+}
+
+my @kmers = split(/,/, $kmers);
+my $bad_kmer = 0;
+foreach (@kmers) {
+    if ($_ !~ /^\d+$/) { $bad_kmer = 1; }
+}
+if ((@kmers == 0) || $bad_kmer) {
+    PipelineAWE::logger('error', "invalid kmeer list: $kmers");
+    exit 1;
+}
+unless ($format && ($format =~ /^fasta|fastq$/)) {
+    $format = ($infile =~ /\.(fq|fastq)$/) ? 'fastq' : 'fasta';
+}
+
+my %value_opts = ();
+for my $ov (split ":", $filter_options) {
+    if ($ov =~ /=/) {
+        my ($option, $value) = split "=", $ov;
+        $value_opts{$option} = $value;
+    }
+}
+
+my $qc_out  = $out_prefix.".qc.stats";
+my $seq_out = $out_prefix.".upload.stats";
+my $d_stats = $out_prefix.".drisee.stats";
+my $d_info  = $out_prefix.".drisee.info";
+my $c_stats = $out_prefix.".consensus.stats";
+my $a_file  = $out_prefix.".assembly.coverage";
+my $qc_stat = {};
+my $run_dir = getcwd;
+my $a_text  = ($assembled == 1) ? "yes" : "no";
+
+# run full sequence stats with bins
+my $seq_stats = PipelineAWE::get_seq_stats($infile, $format, undef, $seq_out);
+$seq_stats->{file_size} = -s $infile;
+
+if (($assembled != 1) || ($format eq 'fastq')) {
+    # create drisee table
+    PipelineAWE::run_cmd("drisee -v -p $proc -t $format -d $run_dir -f $infile $d_stats > $d_info", 1);
+    
+    # get summary drisee
+    if (-s $d_stats) {
+        my $d_score = `head -2 $d_stats | tail -1 | cut -f8`;
+        chomp $d_score;
+        $qc_stat->{"drisee_score_raw"} = sprintf("%.3f", $d_score);
+    }
+    
+    # create consensus table
+    my $max_ln = 600;
+    if (exists $value_opts{"max_ln"}) {
+        $max_ln = min($max_ln, $value_opts{"max_ln"});
+    } elsif (exists $seq_stats->{length_max}) {
+        $max_ln = min($max_ln, $seq_stats->{length_max});
+    } else {
+        $max_ln = 100;
+    }
+    PipelineAWE::run_cmd("consensus.py -v -b $max_ln -t $format -i $infile -o $c_stats");
+    PipelineAWE::run_cmd("touch $a_file");
+} else {
+    PipelineAWE::run_cmd("touch $d_stats");
+    PipelineAWE::run_cmd("touch $d_info");
+    PipelineAWE::run_cmd("touch $c_stats");
+    # create assembly abundance file
+    my $cov_found_count = 0;
+    my $total_reads = 0;
+    open ABUN, ">$a_file" || exit 1;
+    open SEQS, $infile || exit 1;
+    while (my $line = <SEQS>) {
+        chomp $line;
+        if ($line =~ /^>(\S+\_\[cov=(\S+)\]\S*).*$/) {
+            my $seq = $1;
+            my $abun = $2;
+            print ABUN "$seq\t$abun\n";
+            $cov_found_count++;
+            $total_reads++;
+        } elsif ($line =~ /^>(\S+).*$/) {
+            my $seq = $1;
+            print ABUN "$seq\t1\n";
+            $total_reads++;
+        }
+    }
+    close SEQS;
+    close ABUN;
+    # create assembly abundace stats
+    my $percent = sprintf( "%.2f", ( int ( ( ($cov_found_count / $total_reads) * 10000 ) + 0.5 ) ) / 100 );
+    $qc_stat->{'percent_reads_with_coverage'} = $percent;
+}
+
+# create kmer profile
+foreach my $len (@kmers) {
+    PipelineAWE::run_cmd("kmer-tool -l $len -p $proc -i $infile -t $format -o $out_prefix.kmer.$len.stats -f histo -r -d $run_dir");
+}
+
+# process stats into JSON struct
+my $upload = {
+    length_histogram => PipelineAWE::file_to_array("$seq_out.lens"),
+    gc_histogram     => PipelineAWE::file_to_array("$seq_out.gcs")
+};
+my $qc = {
+    drisee     => get_drisee($d_stats, $qc_stat),
+    bp_profile => get_nucleo($c_stats),
+    kmer       => {}
+};
+foreach my $len (@kmers) {
+    $qc->{"kmer"}->{$len."_mer"} = get_kmer("$out_prefix.kmer.$len.stats", $len);
+}
+
+# output stats
+PipelineAWE::print_json($seq_out, $upload);
+PipelineAWE::print_json($qc_out, $qc);
+
+# get drisee info
+my $drisee_summary_stats = {
+    drisee_input_seqs => 1,
+    drisee_processed_bins => 1,
+    drisee_processed_seqs => 1,
+    drisee_score => 1
+};
+if (-s $d_info) {
+    my @bin_stats = `tail -4 $d_info`;
+    chomp @bin_stats;
+    foreach my $line (@bin_stats) {
+        my ($key, $val) = split('\t', $line);
+        $key =~ s/\s+/_/g;
+        $key = lc($key);
+        unless ($key =~ /^drisee/i) {
+            $key = 'drisee_'.$key
+        }
+        if (exists $drisee_summary_stats->{$key}) {
+            $qc_stat->{$key} = $val;
+        }
+    }
+}
+
+# output attributes
+PipelineAWE::create_attr($seq_out.'.json', $seq_stats, {assembled => $a_text, data_type => "statistics", file_format => "json"});
+PipelineAWE::create_attr($qc_out.'.json', $qc_stat, {assembled => $a_text, data_type => "statistics", file_format => "json"});
+PipelineAWE::create_attr($a_file.'.json', $qc_stat, {assembled => $a_text, data_type => "coverage", file_format => "text"});
+
+exit 0;
+
+sub get_usage {
+    return "USAGE: mgrast_qc.pl -input=<input file> -format=<sequence format> -out_prefix=<output prefix> [-proc=<number of threads, default 8>, -kmers=<kmer list, default 6,15>, -assembled=<0 or 1, default 0>]\noutputs: \${out_prefix}.drisee.stats, \${out_prefix}.drisee.info, \${out_prefix}.consensus.stats, \${out_prefix}.kmer.\$len.stats, \${out_prefix}.assembly.coverage, \${out_prefix}.assembly.coverage.stats\n";
+}
+
+sub get_drisee {
+    my ($dfile, $stats) = @_;
+    
+    my $bp_set = ['A', 'T', 'C', 'G', 'N', 'InDel'];
+    my $drisee = PipelineAWE::file_to_array($dfile);
+    my $ccols  = ['Position'];
+    map { push @$ccols, $_.' match consensus sequence' } @$bp_set;
+    map { push @$ccols, $_.' not match consensus sequence' } @$bp_set;
+    my $data = { summary  => { columns => [@$bp_set, 'Total'], data => undef },
+                 counts   => { columns => $ccols, data => undef },
+                 percents => { columns => ['Position', @$bp_set, 'Total'], data => undef }
+               };
+    unless ($drisee && (@$drisee > 2) && ($drisee->[1][0] eq '#')) {
+        return $data;
+    }
+    for (my $i=0; $i<6; $i++) {
+        $data->{summary}{data}[$i] = $drisee->[1][$i+1] * 1.0;
+    }
+    $data->{summary}{data}[6] = $stats->{drisee_score_raw} ? $stats->{drisee_score_raw} * 1.0 : undef;
+    my $raw = [];
+    my $per = [];
+    foreach my $row (@$drisee) {
+        next if ($row->[0] =~ /\#/);
+	    @$row = map { int($_) } @$row;
+	    push @$raw, $row;
+	    if ($row->[0] > 50) {
+	        my $x = shift @$row;
+	        my $sum = sum @$row;
+	        if ($sum == 0) {
+	            push @$per, [ $x, 0, 0, 0, 0, 0, 0, 0 ];
+	        } else {
+	            my @tmp = map { sprintf("%.2f", 100 * (($_ * 1.0) / $sum)) * 1.0 } @$row;
+	            push @$per, [ $x, @tmp[6..11], sprintf("%.2f", sum(@tmp[6..11])) * 1.0 ];
+            }
+	    }
+    }
+    $data->{counts}{data} = $raw;
+    $data->{percents}{data} = $per;
+    return $data;
+}
+
+sub get_nucleo {
+    my ($nfile) = @_;
+    
+    my $cols = ['Position', 'A', 'T', 'C', 'G', 'N', 'Total'];
+    my $nuc  = PipelineAWE::file_to_array($nfile);
+    my $data = { counts   => { columns => $cols, data => undef },
+                 percents => { columns => [@$cols[0..5]], data => undef }
+               };
+    unless ($nuc && (@$nuc > 2)) {
+        return $data;
+    }
+    my $raw = [];
+    my $per = [];
+    foreach my $row (@$nuc) {
+        next if (($row->[0] eq '#') || (! $row->[6]));
+        @$row = map { int($_) } @$row;
+        push @$raw, [ $row->[0] + 1, $row->[1], $row->[4], $row->[2], $row->[3], $row->[5], $row->[6] ];
+        unless (($row->[0] > 100) && ($row->[6] < 1000)) {
+    	    my $sum = $row->[6];
+    	    if ($sum == 0) {
+	            push @$per, [ $row->[0] + 1, 0, 0, 0, 0, 0 ];
+	        } else {
+    	        my @tmp = map { floor(100 * 100 * (($_ * 1.0) / $sum)) / 100 } @$row;
+    	        push @$per, [ $row->[0] + 1, $tmp[1], $tmp[4], $tmp[2], $tmp[3], $tmp[5] ];
+	        }
+        }
+    }
+    $data->{counts}{data} = $raw;
+    $data->{percents}{data} = $per;
+    return $data;
+}
+
+sub get_kmer {
+    my ($kfile, $num) = @_;
+    
+    my $cols = [ 'count of identical kmers of size N',
+    			 'number of times count occures',
+    	         'product of column 1 and 2',
+    	         'reverse sum of column 2',
+    	         'reverse sum of column 3',
+    		     'ratio of column 5 to total sum column 3 (not reverse)'
+               ];
+    my $kmer = PipelineAWE::file_to_array($kfile);
+    my $data = { columns => $cols, data => undef };
+    unless ($kmer && (@$kmer > 1)) {
+        return $data;
+    }
+    foreach my $row (@$kmer) {
+        @$row = map { $_ * 1.0 } @$row;
+    }
+    $data->{data} = $kmer;
+    return $data;}
+Adapter Trimming
+import sys
+import os
+from optparse import OptionParser
+
+try:
+    from string import maketrans
+except ImportError:
+    maketrans = "".maketrans
+
+from subprocess import check_call
+import shutil
+from os.path import basename, dirname, exists, isdir, isfile, abspath
+
+def idfiletype(fname):
+    with open(fname) as p:
+        firstline = p.readline()
+        if firstline[0] == ">":
+            return "FASTA"
+        if firstline[0] == "@":
+            return "FASTQ"
+        sys.exit("Cannot identify sequence file type")
+
+def remove_fastx_suffix(fname):
+    # remove suffixes .fastq and .fasta, retain other suffixes
+    if fname[-6:-1] == ".fast":
+        stem = fname[:-6]
+    else:
+        stem = fname
+    return stem
+
+def idvector(fname):
+    '''Run bowtie2 against two libraries of adapters; create intermediate file with sorted list of adapter names'''
+    if TYPE == "FASTA":
+        OPTIONS = "-f"
+    else:
+        OPTIONS = "-q"
+    if not exists(DATAPATH+"/vectors-P5.4.bt2"):
+        sys.stderr.write("Can't find bowtie2 index in data directory {}!\n".format(DATAPATH))
+        sys.exit(1)
+    check_call("bowtie2 -x {}/vectors-P5 {} {} --no-head --local --upto 2000000 -p 4 > {}.P5.tmp 2> {}.P5.err".format(DATAPATH, OPTIONS, fname, filestem, filestem), shell=True)
+    check_call("bowtie2 -x {}/vectors-P7 {} {} --no-head --local --upto 2000000 -p 4 > {}.P7.tmp 2> {}.P7.err".format(DATAPATH, OPTIONS, fname, filestem, filestem), shell=True)
+    check_call("cut -f 3  {}.P5.tmp | grep -v '*' | head -n 100000 | sort | uniq -c | awk '{{print $2 \"\t\" $1}}' | sort -k 2 -n -r > {}.P5.csv".format(filestem, filestem), shell=True)
+    check_call("cut -f 3  {}.P7.tmp | grep -v '*' | head -n 100000 | sort | uniq -c | awk '{{print $2 \"\t\" $1}}' | sort -k 2 -n -r > {}.P7.csv".format(filestem, filestem), shell=True)
+    if not opts.verbose:
+        os.remove(filestem+".P5.tmp"); os.remove(filestem+".P7.tmp"); os.remove(filestem+".P5.err"); os.remove(filestem+".P7.err")
+    return
+
+def revc(s):
+    '''reverse complement a string'''
+    t = " " * len(s)
+    intab = "AaCcGgTt"
+    outtab = "TtGgCcAa"
+    trantab = maketrans(intab, outtab)
+    t = s.translate(trantab)[::-1]
+    return t
+
+def write_adapter_fasta(filename, namesandadapters):
+    '''Writes a fasta file containing a handful of sequence names, sequences'''
+    fh = open(filename, 'w')
+    assert len(namesandadapters) % 2 == 0
+    for i in range(int(len(namesandadapters)/2)):
+        if len(namesandadapters[2*i + 1]) > 0:
+            fh.write(">"+namesandadapters[2*i]+"\n" +
+                     namesandadapters[2*i + 1] + "\n")
+    fh.close()
+
+
+def read_fasta_to_table(filen):
+    '''Loads a simple fasta file into a dictionary'''
+    table = {}
+    try:
+        FILE = open(filen)
+    except IOError:
+        sys.stderr.write("Can't open file "+ filen + "!\n")
+        sys.exit(1)
+    for line in FILE:
+        if line[0] == ">":
+            header = line.strip()[1:].split()[0]
+        else:
+            sequence = line.strip()
+            table[header] = sequence
+    return table
+
+def grab_first_field(filen):
+    '''Opens file, returns the header name of the first field'''
+    try:
+        contents = open(filen).readlines()
+    except IOError:
+        sys.stderr.write("Can't open file "+ filen + "!\n")
+        sys.exit(1)
+    try:
+        firstfield = contents[0].strip().split("\t")[0]
+        return firstfield
+    except IndexError:
+        return ""
+
+if __name__ == '__main__':
+    usage = "usage: %prog [-i] <input seqfile> -o <scrubbed seqfile>\nExamines FASTA or FASTQ for barcodes"
+    parser = OptionParser(usage)
+    parser.add_option("-p", "--processes", dest="processes", type=int, default=4, help="Number of processes (default 4)")
+    parser.add_option("-i", "--input", dest="input", default=None, help="Input sequence file.")
+    parser.add_option("-o", "--output", dest="output", default=None, help="Output scrubbed file.")
+    parser.add_option("-l", "--logfile", dest="logfile", default=None, help="Output log file [default STDOUT]")
+    parser.add_option("-t", "--tmpdir", dest="tmpdir", default=".", help="DIR for intermediate files [default CWD]")
+    parser.add_option("-v", "--verbose", dest="verbose", action="store_true", default=False, help="Verbose [default off]")
+
+    (opts, args) = parser.parse_args()
+    if not (opts.input and isfile(opts.input)):
+        if len(args) == 1 and isfile(args[0]):
+            filename = args[0]
+        else:
+            parser.error("Missing input file or wrong number of arguments")
+    else:
+        filename = opts.input
+
+    TYPE = idfiletype(filename)
+    TMPDIR = abspath(opts.tmpdir)
+    assert isdir(TMPDIR)
+
+    filestem = remove_fastx_suffix(os.path.join(TMPDIR, basename(filename))) # for intermediate
+
+    if opts.verbose:
+        print("TMPDIR:", TMPDIR)
+        print("filestem:", filestem)
+
+#  build path to find data files using head of module __file__
+    DATAPATH = os.path.join(dirname(dirname(abspath(__file__))), "data")
+    if opts.verbose:
+        print("TYPE:", TYPE)
+        print("DATAPATH:", DATAPATH)
+    if not opts.output:  # put output files in input directory
+        outputfile = remove_fastx_suffix(filename) + ".scrubbed." + TYPE.lower()
+    else:
+        outputfile = opts.output
+    if not opts.logfile:  # put log file in same dir as output
+        outstem = remove_fastx_suffix(outputfile)
+        logfile = outstem + ".log"
+    else:
+        logfile = opts.logfile
+    idvector(filename)
+    P5table = read_fasta_to_table(os.path.join(DATAPATH, "vectors-P5.fa"))
+    P7table = read_fasta_to_table(os.path.join(DATAPATH, "vectors-P7.fa"))
+    P5table[""] = ""
+    P7table[""] = ""
+    P5adaptername = grab_first_field(filestem + ".P5.csv")
+    P7adaptername = grab_first_field(filestem + ".P7.csv")
+    P5adapter = P5table[P5adaptername]
+    P7adapter = P7table[P7adaptername]
+    P5r = revc(P5adapter)
+    P7r = revc(P7adapter)
+    if opts.verbose:
+        print(P5adapter)
+        print(P5r)
+        print(P7adapter)
+        print(P7r)
+
+    adaptorfile = filestem + ".adapter.fa"
+    skewoutname = filestem + ".4"
+    skewoptions = "-k 5 -l 0 --quiet -t {} -r .2 -m any".format(str(opts.processes))
+    write_adapter_fasta(adaptorfile,
+                        [P5adaptername, P5adapter, P5adaptername+"_R",
+                        P5r, P7adaptername, P7adapter,
+                        P7adaptername+"_R", P7r])
+
+    skewcmd = "skewer -x {adaptorfile} {options} {filename} -o {filestem}.4".format(adaptorfile=adaptorfile, options=skewoptions, filename=filename, filestem=filestem)
+    if opts.verbose:
+        print(skewcmd)
+        print("mv", filestem + ".4-trimmed.fastq", outputfile)
+        print("mv", filestem + ".4-trimmed.log", logfile)
+    check_call(skewcmd.split(" "))
+
+    shutil.move(filestem + ".4-trimmed.fastq", outputfile)
+    shutil.move(filestem + ".4-trimmed.log", logfile)
+
+    if not opts.verbose:
+        os.remove(adaptorfile)
+        os.remove(filestem+".P5.csv")
+        os.remove(filestem+".P7.csv")
+Denoising and normalization
+
+#input: .fastq
+#outputs:  ${out_prefix}.passed.fna, ${out_prefix}.removed.fna
+
+use strict;
+use warnings;
+no warnings('once');
+
+use PipelineAWE;
+use Getopt::Long;
+use Cwd;
+umask 000;
+
+# options
+my $api_url    = "";
+my $input_file = "";
+my $format     = "";
+my $out_prefix = "prep";
+my $filter_options = "";
+my $do_not_create_index_files = 0 ;
+my $help = 0;
+my $options = GetOptions (
+    "api_url=s" => \$api_url,
+    "input=s" => \$input_file,
+    "format=s" => \$format,
+    "out_prefix=s" => \$out_prefix,
+    "filter_options=s" => \$filter_options,
+    "no-shock" => \$do_not_create_index_files,
+    "help!" => \$help
+);
+
+if ($help){
+    print get_usage();
+    exit 0;
+}elsif (length($input_file)==0){
+    PipelineAWE::logger('error', "input file was not specified");
+    exit 1;
+}elsif (! -e $input_file){
+    PipelineAWE::logger('error', "input sequence file [$input_file] does not exist");
+    exit 1;
+}
+
+unless ($api_url) {
+    $api_url = $PipelineAWE::default_api;
+}
+
+# get api variable
+my $api_key = $ENV{'MGRAST_WEBKEY'} || undef;
+
+unless ($format && ($format =~ /^fasta|fastq$/)) {
+    $format = ($input_file =~ /\.(fq|fastq)$/) ? 'fastq' : 'fasta';
+}
+
+my $passed_seq  = $out_prefix.".passed.fna";
+my $removed_seq = $out_prefix.".removed.fna";
+my $run_dir = getcwd;
+
+# get filter options
+# default => filter_ln:min_ln=<MIN>:max_ln=<MAX>:filter_ambig:max_ambig=5:dynamic_trim:min_qual=15:max_lqb=5
+unless ($filter_options) {
+  if ($format eq 'fasta') {
+    my @out = `seq_length_stats.py -i $input_file -t fasta -f | cut -f2`;
+    chomp @out;
+    my $mean = $out[2];
+    my $stdv = $out[3];
+    my $min  = int( $mean - (2 * $stdv) );
+    my $max  = int( $mean + (2 * $stdv) );
+    if ($min < 0) { $min = 0; }
+    $filter_options = "filter_ln:min_ln=".$min.":max_ln=".$max.":filter_ambig:max_ambig=5";
+  }
+  else {
+    $filter_options = "dynamic_trim:min_qual=15:max_lqb=5";
+  }
+}
+
+# skip it
+if ($filter_options eq 'skip') {
+    if ($format eq 'fasta') {
+        PipelineAWE::run_cmd("mv $input_file $passed_seq");
+    } else {
+        PipelineAWE::run_cmd("seqUtil --fastq2fasta -i $input_file -o $passed_seq");
+    }
+    PipelineAWE::run_cmd("touch $removed_seq");
+}
+# do not skip
+else {  
+    my $cmd_options = "";
+    for my $ov (split ":", $filter_options) {
+        if ($ov =~ /=/) {
+            my ($option, $value) = split "=", $ov;
+            $cmd_options .= "-".$option." ".$value." ";
+        } else {
+            $cmd_options .= "-".$ov." ";
+        }
+    }
+    # run cmd
+    PipelineAWE::run_cmd("filter_sequences -i $input_file -format $format -o $passed_seq -r $removed_seq $cmd_options");
+}
+
+# file is empty !!!
+if (-z $passed_seq) {
+    my $user_attr = PipelineAWE::get_userattr();
+    my $job_name  = $user_attr->{name};
+    my $job_id    = $user_attr->{id};
+    my $proj_name = $user_attr->{project_name};
+    my $subject   = "MG-RAST Job Failed";
+    my $body_txt  = qq(
+    PipelineAWE::post_data($api_url."/user/".$user_attr->{owner}."/notify", $api_key, {'subject' => $subject, 'body' => $body_txt});
+    PipelineAWE::logger('error', "pipeline failed, no sequences passed preprocessing");
+    # exit failed-permanent
+    exit 42;
+}
+
+# get stats
+my $pass_stats = PipelineAWE::get_seq_stats($passed_seq, 'fasta');
+my $fail_stats = PipelineAWE::get_seq_stats($removed_seq, 'fasta');
+
+# output attributes
+PipelineAWE::create_attr($passed_seq.'.json', $pass_stats, {data_type => "passed"});
+PipelineAWE::create_attr($removed_seq.'.json', $fail_stats, {data_type => "removed"});
+
+# create subset record list
+# note: parent and child files in same order
+if (($format eq 'fasta') && ($filter_options ne 'skip') and not ($do_not_create_index_files)) {
+    PipelineAWE::run_cmd("index_subset_seq.py -p $input_file -c $passed_seq -c $removed_seq -s -m 20 -t $run_dir");
+    PipelineAWE::run_cmd("mv $passed_seq.index $passed_seq");
+    PipelineAWE::run_cmd("mv $removed_seq.index $removed_seq");
+}
+
+exit 0;
+
+sub get_usage {
+    return qq "
+USAGE: mgrast_preprocess.pl 
+          -input=<input fasta or fastq>
+          -format=<sequence format> 
+          [-out_prefix=<output prefix> 
+          -filter_options=<string_filter_options>]
+          [-no-shock]
+            Don't create subset node files
+OUTPUTS: \${out_prefix}.passed.fna and \${out_prefix}.removed.fna"."\n\n";}
+
+
+ Identify putative protein coding features (genecalling)
+
+#input: fasta
+#outputs:  ${out_prefix}.faa, ${out_prefix}.fna
+
+use strict;
+use warnings;
+no warnings('once');
+
+use PipelineAWE;
+use Getopt::Long;
+use Cwd;
+umask 000;
+
+# options
+my $out_prefix = "genecall";
+my $fasta   = "";
+my $proc    = 8;
+my $size    = 100;
+my $type    = "454";
+my $help    = 0;
+my $options = GetOptions (
+        "out_prefix=s" => \$out_prefix,
+        "input=s" => \$fasta,
+		"proc:i"  => \$proc,
+		"size:i"  => \$size,
+		"type:s"  => \$type,
+        "help!"   => \$help
+);
+
+if ($help){
+    print get_usage();
+    exit 0;
+}elsif (length($fasta)==0){
+    PipelineAWE::logger('error', "input file was not specified");
+    exit 1;
+}elsif (! -e $fasta){
+    PipelineAWE::logger('error', "input sequence file [$fasta] does not exist");
+    exit 1;
+}
+
+my %types = (sanger => 'sanger_10', 454 => '454_30', illumina => 'illumina_10', complete => "complete");
+unless (exists $types{$type}) {
+    PipelineAWE::logger('error', "input type [$type] is not supported");
+    exit 1;
+}
+
+my $run_dir = getcwd;
+PipelineAWE::run_cmd("parallel_FragGeneScan.py -v -p $proc -s $size -t $types{$type} -d $run_dir $fasta $out_prefix");
+
+exit 0;
+
+sub get_usage {
+    return "USAGE: mgrast_genecalling.pl -input=<input fasta> [-out_prefix=<output prefix> -type=<454 | sanger | illumina | complete> -proc=<number of threads, default: 8> -size=<size, default: 100>]\noutputs: \${out_prefix}.faa, \${out_prefix}.fna\n";}
+Amino acid sequence clustering
+
+: fasta
+#outputs:  ${out_prefix}.aa${pid}.faa, ${out_prefix}.aa${pid}.mapping
+#            OR
+#          ${out_prefix}.rna${pid}.fna, ${out_prefix}.rna${pid}.mapping
+#            OR
+#          ${out_prefix}.dna${pid}.fna, ${out_prefix}.dna${pid}.mapping
+
+use strict;
+use warnings;
+no warnings('once');
+
+use PipelineAWE;
+use Getopt::Long;
+umask 000;
+
+# options
+my $out_prefix = "cluster";
+my $fasta   = "";
+my $pid     = 90;
+my $memory  = 16;
+my $aa      = 0;
+my $rna     = 0;
+my $dna     = 0;
+my $help    = 0;
+my $options = GetOptions (
+        "out_prefix=s" => \$out_prefix,
+        "input=s"  => \$fasta,
+		"pid=i"    => \$pid,
+		"memory=i" => \$memory,
+		"aa!"      => \$aa,
+        "rna!"     => \$rna,
+        "dna!"     => \$dna,
+        "help!"    => \$help
+);
+
+if ($help){
+    print get_usage();
+    exit 0;
+}elsif (length($fasta)==0){
+    PipelineAWE::logger('error', "input file was not specified");
+    exit 1;
+}elsif (! -e $fasta){
+    PipelineAWE::logger('error', "input sequence file [$fasta] does not exist");
+    exit 1;
+}elsif ((! $pid) || ($pid < 40)){
+    PipelineAWE::logger('error', "percent identity must be greater than 50");
+    exit 1;
+}elsif ((! $aa) && (! $rna) && (! $dna)){
+    PipelineAWE::logger('error', "one of the following modes is required: --aa, --rna, --dna");
+    exit 1;
+}
+
+my ($cmd, $word, $code, $output);
+if ($aa) {
+    ($cmd, $word, $code, $output) = ("cdhit", word_length("aa", $pid), "aa", $out_prefix.".aa".$pid.".faa");
+} else {
+    $code = $rna ? 'rna' : 'dna';
+    ($cmd, $word, $output) = ("cdhit-est", word_length($code, $pid), $out_prefix.".".$code.$pid.".fna");
+}
+my $mem = $memory * 1024;
+# run clustering
+PipelineAWE::run_cmd("$cmd -n $word -d 0 -T 0 -M $mem -c 0.$pid -i $fasta -o $output");
+
+# turn $output.clstr into $output.mapping
+my $clust = [];
+my $parse = "";
+my $s_num = 0;
+my $c_num = 0;
+my $c_seq = 0;
+my $mapf  = $out_prefix.".".$code.$pid.".mapping";
+
+open(IN, "<".$output.".clstr") || exit 1;
+open(OUT, ">".$mapf) || exit 1;
+
+while (my $line = <IN>) {
+    chomp $line;
+    # process previous cluster
+    if ($line =~ /^>Cluster/) {
+        ($parse, $s_num) = parse_clust($clust);
+        if ($parse) {
+            print OUT $parse;
+            $c_num += 1;
+            $c_seq += $s_num;
+        }
+        $clust = [];
+    } else {
+        push @$clust, $line;
+    }
+}
+# process last cluster
+($parse, $s_num) = parse_clust($clust);
+if ($parse) {
+    print OUT $parse;
+    $c_num += 1;
+    $c_seq += $s_num;
+}
+close(IN);
+close(OUT);
+unlink($output.".clstr");
+
+# get stats
+#my $fast = $aa ? 1 : 0;
+#my $seq_stats = PipelineAWE::get_seq_stats($output, 'fasta', $fast);
+#my $cls_stats = {cluster_count => $c_num, clustered_sequence_count => $c_seq};
+
+# output attributes
+PipelineAWE::create_attr($output.".json", undef, {data_type => "sequence", file_format => "fasta"});
+PipelineAWE::create_attr($mapf.".json", undef, {data_type => "cluster", file_format => "text"});
+
+exit 0;
+
+sub get_usage {
+    return "USAGE: mgrast_cluster.pl -input=<input fasta> <-aa|-rna|-dna> -pid=<percentage of identification, default 90> [-out_prefix=<output prefix> -memory=<memory usage in GB, default is 16>]\n";
+}
+
+# process cluster file lines
+sub parse_clust {
+    my ($clust) = @_;
+    
+    if (@$clust < 2) {
+        return ("", 0); # cluster of 1
+    }
+    my $seed = "";
+    my $ids  = [];
+    my $pers = [];
+    foreach my $x (@$clust) {
+        if ($x =~ /\s>(\S+)\.\.\.\s+(\S.*)$/) {
+            if ($2 eq '*') {
+                $seed = $1;
+            } else {
+                push @$ids, $1;
+                push @$pers, (split(/\s+/, $2))[1];
+            }
+        } else {
+            PipelineAWE::logger('warn', "bad cluster line: $x");
+            return ("", 0);}}
+    unless ($seed && (@$ids > 0)) {
+        PipelineAWE::logger('warn', "bad cluster block");
+        return ("", 0);
+    } else {
+        return ($seed."\t".join(",", @$ids)."\t".join(",", @$pers)."\n", scalar(@$ids)+1);}
+}
+
+# determine optimal word length for clustering
+sub word_length {
+    my ($type, $pid) = @_;
+    
+    if ($type eq 'aa') {
+        if ($pid > 70) {
+            return 5;
+        } elsif ($pid > 60) {
+            return 4;
+        } elsif ($pid > 50) {
+            return 3;
+        } else {
+            return 2;
+        }
+    } else {
+        if ($pid > 98) {
+            return 10;
+        } elsif ($pid > 95) {
+            return 9;
+        } elsif ($pid > 90) {
+            return 8;
+        } elsif ($pid > 88) {
+            return 7;
+        } elsif ($pid > 85) {
+            return 6;
+        } elsif ($pid > 80) {
+            return 5;
+        } elsif ($pid > 75) {
+            return 4;
+        } elsif ($pid > 60) {
+            return 3;
+        } else {
+            return 2;}}}
